@@ -1,0 +1,173 @@
+pipeline {
+    agent any
+        
+    parameters {
+        choice(name:"Publish",choices:"false\ntrue",description:"是否是发布版本.")
+        choice(name:"Debug",choices:"release\ndebug",description:"release:无调试信息\ndebug:有调试信息")
+        choice(name:"GameName",choices:"JenkinsBuild",description:"游戏英文名,用于安装包名及生成路径")
+        choice(name:"SaveRoot",choices:"${UnityOutputRoot}/iOS_${GameName}/Release",description:"发布版本根目录,其按照\"打包号\"建立子目")
+    }
+    
+    
+    environment { 
+        def Publish = "${params.Publish}"
+        def Debug = "${params.Debug}"
+        def GameName = "${params.GameName}"
+        def ProjectPath = "${env.WORKSPACE}"
+        
+        def GitBranch = "${params.GitBranch}"
+        def BuildID = "${env.BUILD_ID}"
+        def UnityPath="${env.Unity2017_4}"
+        def BuglyToolFile = "${env.iOSBuglyToolPath}"
+        
+        def RootDir = "${params.SaveRoot}/${BuildID}"
+        def SaveFile = "${RootDir}/${GameName}_${BuildID}_${Debug}"
+        def BuildDir = "${RootDir}/Build"
+        def LogFile = "${RootDir}/editor_log.txt"
+        def PythonDir = "Assets/Third/UnityBatchBuild/Editor/Python"        
+        def BuildTarget = "iOS"
+        def GitBranchStr = "${GitBranch}".replaceAll("origin/", "").replaceAll("/", "_")
+    }
+
+    stages {
+        /* 清理未跟踪代码,只保留Library文件夹,避免再次生成*/
+        /*清理发布安装包目录*/
+        stage("Clean"){
+            steps{
+                sh "git clean -dxf -e Library"
+            }
+        }
+        
+        /*导出Xcode工程*/
+        stage("Export Project") {
+            steps {
+                script {
+                    def PythonPath = "${PythonDir}/BatchBuild.py"
+
+                    def IsDebug = false
+                    if("${Debug}" == "true" && "${Publish}" == "false") {
+                        IsDebug = true
+                    }
+
+                    def BuildArgs = "SaveFile~${SaveFile} Debug~${IsDebug}"
+                
+                    sh "python ${PythonPath} --UnityPath=${UnityPath} --ProjectPath=${ProjectPath} --BuildTarget=${BuildTarget} --BuildArgs='${BuildArgs}' --LogFile=${LogFile}"
+                }
+            }
+        }
+        
+        /*编译工程*/
+        stage("Build") {
+            steps {
+                script {
+                    def ipaName = "${GameName}-" + '${SHORT_VERSION}' + "-${BuildID}-${Debug}E"
+                    xcodeBuild appURL: '', assetPackManifestURL: '', buildDir: '', buildIpa: true, bundleID: '', bundleIDInfoPlistPath: '', cfBundleShortVersionStringValue: '', cfBundleVersionValue: '', compileBitcode: false, configuration: 'Release', developmentTeamID: '', developmentTeamName: 'LIONBIRD LIMITED (28NSK35R9Q)', displayImageURL: '', fullSizeImageURL: '', ipaExportMethod: 'development', ipaName: "${ipaName}", ipaOutputDirectory: "${BuildDir}", keychainName: 'login.keychain', keychainPath: '', keychainPwd: '', logfileOutputDirectory: '', manualSigning: false, provisioningProfiles: [[provisioningProfileAppId: '', provisioningProfileUUID: '']], sdk: '', symRoot: '', target: '', thinning: '', unlockKeychain: true, uploadBitcode: false, uploadSymbols: false, xcodeProjectFile: '', xcodeProjectPath: "${SaveFile}", xcodeSchema: 'Unity-iPhone', xcodeWorkspaceFile: '', xcodebuildArguments: ''
+                }
+            }
+        }
+        
+        /*打包符号文件*/
+        stage("Zip Symbol") {
+            steps {
+                script {
+                    def PythonPath = "${PythonDir}/ZipSymFile.py"
+                    /*Xcode 自动生成的符号压缩文件是ipa名-dSYM.zip*/
+                    def SaveTemplate ="${BuildDir}/${GameName}-%s-${BuildID}-${Debug}E-dSYM.zip"
+
+                    sh "python $PythonPath --BuildDir=${BuildDir} --SymRoot=${SaveFile} --SaveTemplate=${SaveTemplate}"
+                }
+            }
+        }
+        
+        /*复制安装包到发布目录*/
+        stage("Copy File"){
+            steps{
+                script {
+                    def PythonPath = "${PythonDir}/FindOrCopyFile.py"
+
+                    def PublishStr = ""
+                    if("${Publish}" == "true") {
+                        PublishStr="_Publish"
+                    }
+                    def Now = new Date().format('yyyyMMdd_HHmm')
+                    def UploadPath = "Upload/iOS_${GameName}/${GitBranchStr}/${Now}_${BuildID}${PublishStr}"
+
+                    sh "python ${PythonPath} --FileOrDir=${BuildDir} --TargetDir=${UploadPath} --SubName=.ipa"
+
+                    sh "python $PythonPath --FileOrDir=${BuildDir} --TargetDir=${UploadPath} --SubName=-dSYM.zip"
+                }
+            }
+        }
+        
+        /*上传安装包*/
+        stage("Upload Package") {
+            steps {
+                script {
+                    ftpPublisher alwaysPublishFromMaster: false, continueOnError: false, failOnError: false, publishers: [[configName: 'Test', transfers: [[asciiMode: false, cleanRemote: false, excludes: '', flatten: false, makeEmptyDirs: false, noDefaultExcludes: false, patternSeparator: '[, ]+', remoteDirectory: '', remoteDirectorySDF: false, removePrefix: 'Upload/', sourceFiles: 'Upload/**/*']], usePromotionTimestamp: false, useWorkspaceInPromotion: false, verbose: false]]
+                }
+            }
+        }
+        
+
+        
+        /*上传符号文件*/
+        stage("Upload Symbol") {
+            steps {
+                script {
+                    def PythonPath = "${PythonDir}/UploadBuglyiOS.py"
+                    def AppID = "11220531fe"
+                    def AppKey = "0608c6cd-0dfa-45fc-9eec-edc4336446ba"
+
+                    sh "python ${PythonPath} --SymDir=${RootDir} --AppID=${AppID} --AppKey=${AppKey} --BuglyToolFile=${BuglyToolFile}"
+                }
+            }
+        }
+    }
+
+    
+    post{
+        
+        success {
+            script {
+                echo "Add Git Tag"
+                
+                sshagent(credentials: ['7b300747-3b70-48a7-8e08-f8db24f47590']) {
+                    sh("git tag -a ${JOB_NAME}-${BUILD_ID} -m ${BUILD_TAG}")
+                    sh("git push origin --tags")
+                }                
+            }
+        }
+
+        always {
+            script {
+                try {
+
+                    /*复制Unity Log 到工程目录,附加到邮件中*/
+                    echo "Step Copy Log"
+                    def LogFileDir = "Log"
+                        
+                    sh "mkdir -p ${LogFileDir}"     
+                    sh "cp ${LogFile} ${LogFileDir}"    
+
+                } finally {
+
+                    /*邮件通知*/
+                    echo "Step Notification"
+                    def BodyAppend = '''${DEFAULT_CONTENT}
+从此下载安装包: https://fir.im/and2048
+${BUILD_TAG}-Debug:${Debug}-Publish:${Publish}-GitBranch:${GitBranch}'''
+
+                    def SendTo = "zhaobinkun@cmcm.com"
+                    emailext attachLog: true, compressLog: true, attachmentsPattern: "Log/*.txt", body: "${BodyAppend}", mimeType: "text/plain", postsendScript: '$DEFAULT_POSTSEND_SCRIPT', presendScript: '$DEFAULT_PRESEND_SCRIPT', replyTo: '$DEFAULT_REPLYTO', subject: '$DEFAULT_SUBJECT', to: "${SendTo}"
+
+
+                    /*清理生成文件*/
+                    echo "Step Clean"
+                    sh "rm -fr ${RootDir}"                
+                }
+            }
+        }
+
+
+    }
+}
